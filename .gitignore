@@ -1,0 +1,35 @@
+# Build trees
+/build/
+/build-*/
+/out/
+/cmake-build-*/
+*.o
+*.obj
+*.a
+*.lib
+*.exe
+*.pdb
+*.ilk
+*.exp
+
+# Editor and tooling state
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+compile_commands.json
+.cache/
+
+# Runtime artefacts. These patterns are anchored (or deliberately narrow) so
+# that the source directories named core and store are never ignored.
+/store/
+/latobs-store/
+/core
+core.[0-9]*
+*.log
+*.dmp
+
+# Local validation output
+/package-prefix/
+/downstream-work/

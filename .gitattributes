@@ -1,0 +1,15 @@
+# Copyright 2026 Summon Software Labs.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Text files are stored with LF endings and checked out unchanged on every
+# platform, so the repository contents are identical everywhere and the
+# integrity checks in the tests are not affected by checkout settings.
+
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.zip binary
+*.lobs binary

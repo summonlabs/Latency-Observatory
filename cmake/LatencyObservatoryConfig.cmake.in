@@ -1,0 +1,14 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+
+if(WIN32)
+  include(CheckCXXSourceCompiles)
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/LatencyObservatoryTargets.cmake")
+
+set(LatencyObservatory_VERSION "@PROJECT_VERSION@")
+set(LATENCY_OBSERVATORY_VERSION "@PROJECT_VERSION@")
+
+check_required_components(LatencyObservatory)
