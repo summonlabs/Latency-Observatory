@@ -83,6 +83,6 @@ cannot be inverted.
 | concurrent ingestion stores every record exactly once | `t_concurrency.concurrent_ingest_stores_every_record_once` |
 | transport serves concurrent connections | `t_transport_e2e.serves_requests_over_a_real_socket` |
 
-Tests never use a timeout to decide an outcome. The concurrency tests
+The concurrency tests
 synchronise with latches and join every thread, so a real deadlock would hang the
 suite rather than pass it.
