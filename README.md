@@ -1,6 +1,6 @@
 # Latency Observatory
 
-Latency Observatory is a standalone, vendor neutral Fabric OS runtime that owns
+Latency Observatory is a standalone, vendor-neutral runtime that owns
 end to end and per hop latency **observation** and **attribution**. It is a C++20
 infrastructure project with no external dependencies: the measurement path, the
 aggregation, the persistence format, the worker pool and the network transport
