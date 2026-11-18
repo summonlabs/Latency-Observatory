@@ -6,8 +6,10 @@
 // processes: a server, a client started by this test, and a second client
 // process started by the tool itself.
 
+#include <chrono>
 #include <cstdio>
 #include <fstream>
+#include <future>
 #include <string>
 #include <thread>
 #include <vector>
@@ -16,6 +18,17 @@
 #include "latency_observatory/runtime/transport.hpp"
 #include "support.hpp"
 #include "test_framework.hpp"
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#endif
 
 using namespace latobs;
 using namespace latobs::core;
@@ -195,6 +208,134 @@ LATOBS_TEST(transport, client_reports_connection_failures) {
       runtime::send_request("127.0.0.1", 1, R"({"op":"status"})", 4096);
   CHECK(!response.has_value());
   CHECK(response.error().code() == ErrorCode::IoError);
+}
+
+LATOBS_TEST(transport, finished_connections_are_released_while_one_stays_open) {
+#if defined(_WIN32)
+  TempDir directory("transport-release");
+  runtime::RuntimeConfig config;
+  config.store_directory = directory.path();
+  CHECK_OK(service, runtime::Service::create(config));
+  runtime::TransportConfig transport_config;
+  transport_config.port = 0;
+  transport_config.max_connections = 16;
+  transport_config.max_line_bytes = 64 * 1024;
+  CHECK_OK(server, runtime::LineServer::start(*service, transport_config));
+  std::thread server_thread([&server]() { (void)server->run(); });
+
+  // Nothing below returns early: outcomes are recorded, the server is stopped
+  // and joined, and only then is anything checked.
+  // One client stays connected for the whole test, as a monitoring client would.
+  const SOCKET held = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(server->port());
+  ::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+  const bool held_open =
+      held != INVALID_SOCKET &&
+      ::connect(held, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0;
+  const auto request = [&server]() {
+    return runtime::send_request("127.0.0.1", server->port(), R"({"op":"capabilities"})",
+                                 1024 * 1024)
+        .has_value();
+  };
+  const bool warmed = request();
+  DWORD before = 0;
+  ::GetProcessHandleCount(::GetCurrentProcess(), &before);
+  int served = 0;
+  for (int index = 0; index < 100; ++index) {
+    if (request()) ++served;
+  }
+  DWORD after = 0;
+  ::GetProcessHandleCount(::GetCurrentProcess(), &after);
+  if (held != INVALID_SOCKET) ::closesocket(held);
+  const bool stopped = runtime::send_request("127.0.0.1", server->port(), R"({"op":"shutdown"})",
+                                             1024 * 1024)
+                           .has_value();
+  server_thread.join();
+  CHECK(held_open);
+  CHECK(warmed);
+  CHECK(stopped);
+  CHECK(served == 100);
+  // A finished connection thread that is never joined keeps its handle, so the
+  // count would grow by about one per connection.
+  CHECK(after < before + 64);
+  CHECK_OK_STATUS(service->shutdown());
+#endif
+}
+
+LATOBS_TEST(transport, a_second_server_cannot_take_a_listening_port) {
+  TempDir directory("transport-second-listener");
+  runtime::RuntimeConfig config;
+  config.store_directory = directory.path();
+  CHECK_OK(service, runtime::Service::create(config));
+  runtime::TransportConfig transport_config;
+  transport_config.port = 0;
+  CHECK_OK(first, runtime::LineServer::start(*service, transport_config));
+  runtime::TransportConfig taken = transport_config;
+  taken.port = first->port();
+  const auto second = runtime::LineServer::start(*service, taken);
+  // Two observatories must never share one listening port: the second bind fails.
+  CHECK(!second.has_value());
+  CHECK_OK_STATUS(service->shutdown());
+}
+
+LATOBS_TEST(transport, stop_does_not_wait_for_an_idle_client) {
+#if defined(_WIN32)
+  TempDir directory("transport-idle-stop");
+  runtime::RuntimeConfig config;
+  config.store_directory = directory.path();
+  CHECK_OK(service, runtime::Service::create(config));
+  runtime::TransportConfig transport_config;
+  transport_config.port = 0;
+  CHECK_OK(server, runtime::LineServer::start(*service, transport_config));
+  std::promise<void> ran;
+  std::future<void> done = ran.get_future();
+  std::thread server_thread([&server, &ran]() {
+    (void)server->run();
+    ran.set_value();
+  });
+
+  // Nothing below returns early: outcomes are recorded, the server is stopped
+  // and joined, and only then is anything checked.
+  // One completed request proves a connection thread serves this client; the
+  // thread then waits in a receive for the client's next line.
+  const SOCKET idle = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(server->port());
+  ::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+  const bool connected =
+      idle != INVALID_SOCKET &&
+      ::connect(idle, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0;
+  bool answered = false;
+  const std::string request = "{\"op\":\"capabilities\"}\n";
+  if (connected &&
+      ::send(idle, request.data(), static_cast<int>(request.size()), 0) ==
+          static_cast<int>(request.size())) {
+    std::string reply;
+    char buffer[4096];
+    while (reply.find('\n') == std::string::npos) {
+      const int received = ::recv(idle, buffer, static_cast<int>(sizeof(buffer)), 0);
+      if (received <= 0) break;
+      reply.append(buffer, static_cast<std::size_t>(received));
+    }
+    answered = reply.find('\n') != std::string::npos;
+  }
+
+  // Stopped with the client still connected and idle; closing the client
+  // afterwards releases a run() that is still waiting on it.
+  server->request_stop();
+  const bool returned = done.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+  if (idle != INVALID_SOCKET) ::closesocket(idle);
+  server_thread.join();
+  CHECK(connected);
+  CHECK(answered);
+  // Stopping ends the connection thread's receive. request_stop() only woke
+  // the accept loop, so run() waited in its joins until the idle client left.
+  CHECK(returned);
+  CHECK_OK_STATUS(service->shutdown());
+#endif
 }
 
 LATOBS_TEST_MAIN()

@@ -40,8 +40,10 @@ function(latobs_configure_target target)
   if(LATOBS_ENABLE_ASAN)
     target_compile_definitions(${target} PRIVATE LATOBS_ASAN=1)
     if(MSVC)
-      target_compile_options(${target} PRIVATE /fsanitize=address)
-      target_link_options(${target} PRIVATE /fsanitize=address)
+      # Debug information is required: without it MSVC warns C5072 for every
+      # source, which the warnings-as-errors option turns into an error.
+      target_compile_options(${target} PRIVATE /fsanitize=address /Zi)
+      target_link_options(${target} PRIVATE /fsanitize=address /INCREMENTAL:NO /DEBUG)
     elseif(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
       target_compile_options(${target} PRIVATE -fsanitize=address -fno-omit-frame-pointer)
       target_link_options(${target} PRIVATE -fsanitize=address)

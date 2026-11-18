@@ -28,8 +28,9 @@ set_target_properties(consumer PROPERTIES
 
 if(LATOBS_CONSUMER_ASAN)
   if(MSVC)
-    target_compile_options(consumer PRIVATE /fsanitize=address)
-    target_link_options(consumer PRIVATE /fsanitize=address)
+    # Debug information as in the library: without it MSVC warns C5072.
+    target_compile_options(consumer PRIVATE /fsanitize=address /Zi)
+    target_link_options(consumer PRIVATE /fsanitize=address /INCREMENTAL:NO /DEBUG)
   else()
     target_compile_options(consumer PRIVATE -fsanitize=address -fno-omit-frame-pointer)
     target_link_options(consumer PRIVATE -fsanitize=address)

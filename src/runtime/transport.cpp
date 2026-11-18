@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "latency_observatory/runtime/transport.hpp"
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -51,6 +54,19 @@ void close_socket(SocketHandle handle) {
   closesocket(handle);
 #else
   ::close(handle);
+#endif
+}
+
+// Shuts down an open socket another thread may be blocked on and cancels its
+// pending I/O, so a blocking receive on it returns. Does not close it.
+void interrupt_socket(SocketHandle handle) {
+#if defined(_WIN32)
+  ::shutdown(handle, SD_BOTH);
+  // shutdown() does not end a recv() another thread is already blocked in on
+  // Windows; cancelling the socket's pending I/O does.
+  (void)::CancelIoEx(reinterpret_cast<HANDLE>(handle), nullptr);
+#else
+  ::shutdown(handle, SHUT_RDWR);
 #endif
 }
 
@@ -139,10 +155,18 @@ struct AddressInfoDeleter {
 
 }  // namespace
 
+// A connection thread and the flag it sets as its last step.
+struct ConnectionThread {
+  std::shared_ptr<std::atomic<bool>> finished;
+  std::thread thread;
+};
+
 struct LineServer::Impl {
   SocketHandle listener = kInvalidSocket;
   mutable std::mutex mutex;
-  std::vector<std::thread> connection_threads;
+  std::vector<ConnectionThread> connection_threads;
+  // Sockets a connection thread is serving; request_stop() shuts them down.
+  std::set<SocketHandle> live;
   TransportStats stats;
   std::size_t active_connections = 0;
 };
@@ -153,8 +177,8 @@ LineServer::LineServer(Service& service, TransportConfig config)
 LineServer::~LineServer() {
   request_stop();
   if (impl_ != nullptr) {
-    for (std::thread& thread : impl_->connection_threads) {
-      if (thread.joinable()) thread.join();
+    for (ConnectionThread& entry : impl_->connection_threads) {
+      if (entry.thread.joinable()) entry.thread.join();
     }
     close_socket(impl_->listener);
     impl_->listener = kInvalidSocket;
@@ -189,8 +213,15 @@ Result<std::unique_ptr<LineServer>> LineServer::start(Service& service, Transpor
     const SocketHandle handle = ::socket(entry->ai_family, entry->ai_socktype, entry->ai_protocol);
     if (handle == kInvalidSocket) continue;
     const int reuse = 1;
+#if defined(_WIN32)
+    // SO_REUSEADDR on Windows lets a second socket bind a port that is still
+    // listening; exclusive use makes that second bind fail instead.
+    setsockopt(handle, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+               reinterpret_cast<const char*>(&reuse), static_cast<int>(sizeof(reuse)));
+#else
     setsockopt(handle, SOL_SOCKET, SO_REUSEADDR,
                reinterpret_cast<const char*>(&reuse), static_cast<int>(sizeof(reuse)));
+#endif
     if (::bind(handle, entry->ai_addr, static_cast<int>(entry->ai_addrlen)) == 0 &&
         ::listen(handle, static_cast<int>(config.max_connections)) == 0) {
       listener = handle;
@@ -228,6 +259,14 @@ Result<std::unique_ptr<LineServer>> LineServer::start(Service& service, Transpor
 
 void LineServer::request_stop() {
   if (stop_requested_.exchange(true)) return;
+  if (impl_ != nullptr) {
+    // Connection threads wait in a receive with no deadline, so run() waited
+    // in its joins until every idle client left. Their receives end here.
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    for (const SocketHandle handle : impl_->live) {
+      interrupt_socket(handle);
+    }
+  }
   // Wake the blocking accept by connecting to ourselves, then close the
   // listener so that no new connection can be accepted.
   if (impl_ != nullptr && impl_->listener != kInvalidSocket) {
@@ -253,15 +292,27 @@ Status LineServer::run() {
       return Error(ErrorCode::IoError, "the accept call failed");
     }
     bool accepted = false;
+    bool stopping = false;
     {
       std::lock_guard<std::mutex> lock(impl_->mutex);
-      if (impl_->active_connections < config_.max_connections) {
-        ++impl_->active_connections;
-        ++impl_->stats.connections_accepted;
-        accepted = true;
-      } else {
-        ++impl_->stats.connections_rejected;
+      // Checked under the lock request_stop() takes once it has set the flag:
+      // a connection is either listed before request_stop() shuts the listed
+      // sockets down, or not served at all.
+      stopping = stop_requested_.load();
+      if (!stopping) {
+        if (impl_->active_connections < config_.max_connections) {
+          ++impl_->active_connections;
+          ++impl_->stats.connections_accepted;
+          impl_->live.insert(connection);
+          accepted = true;
+        } else {
+          ++impl_->stats.connections_rejected;
+        }
       }
+    }
+    if (stopping) {
+      close_socket(connection);
+      break;
     }
     if (!accepted) {
       static const std::string busy =
@@ -271,7 +322,8 @@ Status LineServer::run() {
       close_socket(connection);
       continue;
     }
-    impl_->connection_threads.emplace_back([this, connection]() {
+    auto finished = std::make_shared<std::atomic<bool>>(false);
+    std::thread worker([this, connection, finished]() {
       SocketHandle handle = connection;
       while (!stop_requested_.load()) {
         const Result<std::string> line = read_line(handle, config_.max_line_bytes);
@@ -298,30 +350,46 @@ Status LineServer::run() {
           break;
         }
       }
+      {
+        // Delisted before the socket closes, so request_stop() never shuts
+        // down a handle that has been closed or reused.
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        impl_->live.erase(handle);
+      }
       close_socket(handle);
-      std::lock_guard<std::mutex> lock(impl_->mutex);
-      if (impl_->active_connections > 0) --impl_->active_connections;
+      {
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (impl_->active_connections > 0) --impl_->active_connections;
+      }
+      finished->store(true);
     });
-    // Join finished connection threads so the bookkeeping stays bounded.
-    std::lock_guard<std::mutex> lock(impl_->mutex);
-    if (impl_->connection_threads.size() > config_.max_connections * 4) {
-      std::vector<std::thread> live;
-      for (std::thread& thread : impl_->connection_threads) {
-        if (thread.joinable() && impl_->active_connections == 0) {
-          thread.join();
+    // Finished connection threads are joined as soon as they have returned.
+    // They were joined only while no connection at all was active, so one
+    // long-lived client kept every other finished thread, and its handle,
+    // until shutdown.
+    std::vector<ConnectionThread> done;
+    {
+      std::lock_guard<std::mutex> lock(impl_->mutex);
+      impl_->connection_threads.push_back(ConnectionThread{std::move(finished), std::move(worker)});
+      for (auto it = impl_->connection_threads.begin(); it != impl_->connection_threads.end();) {
+        if (it->finished->load()) {
+          done.push_back(std::move(*it));
+          it = impl_->connection_threads.erase(it);
         } else {
-          live.push_back(std::move(thread));
+          ++it;
         }
       }
-      impl_->connection_threads = std::move(live);
+    }
+    for (ConnectionThread& entry : done) {
+      if (entry.thread.joinable()) entry.thread.join();
     }
   }
   {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->stats.stopped = true;
   }
-  for (std::thread& thread : impl_->connection_threads) {
-    if (thread.joinable()) thread.join();
+  for (ConnectionThread& entry : impl_->connection_threads) {
+    if (entry.thread.joinable()) entry.thread.join();
   }
   {
     std::lock_guard<std::mutex> lock(impl_->mutex);
